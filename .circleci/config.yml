@@ -8,9 +8,8 @@ version: 2.1
 #
 #   * `package.json` sets `engines.node` to "^22.13.0 || ^24.0.0 || ^26.0.0",
 #     so the floor is Node 22.13. We pin the newest 22.x convenience image
-#     rather than 24/26 because 22 is the oldest supported line -- if the build
-#     is green on the floor it is green on the newer lines, and the reverse is
-#     not true.
+#     rather than 24/26 because 22 is the oldest supported line -- green on the
+#     floor implies green on the newer lines, and the reverse is not true.
 #   * The tag is fully pinned (22.23.2, not `22` or `22.23`) so a rebuild of
 #     the upstream image cannot silently change the toolchain under us. Bump it
 #     deliberately.
@@ -19,83 +18,120 @@ version: 2.1
 #     sudo, and -- importantly here -- a global `pnpm`. `circleci/setup-node`
 #     requires the package manager binary to already be on PATH; it does not
 #     install one. See CircleCI-Public/cimg-node's Dockerfile.template:
-#     `RUN sudo npm install -g pnpm`.
+#     `RUN sudo npm install -g pnpm`. In 22.23.2 that lands pnpm 11.23.0, which
+#     happens to match this repo's `packageManager` field exactly -- verified by
+#     the "Report toolchain versions" step below, which exists precisely so
+#     that a future image bump that drifts is obvious in the log.
 #   * We use the plain tag, NOT `-browsers`. The `-browsers` variant exists to
 #     supply Chrome/Firefox for the Playwright suite in `packages/rsc`, but we
 #     skip that suite instead (see SKIP_RSC_E2E below), so the extra ~1GB of
 #     image pull would be dead weight on every run.
-#   * pnpm 10+ honours the `packageManager` field ("pnpm@11.23.0"), so pnpm
-#     self-provisions that exact version at first invocation. The pnpm baked
-#     into the image is only a bootstrap.
 #
-# RESOURCE CLASS: large (4 vCPU / 8 GB)
+# RESOURCE CLASS: xlarge (8 vCPU / 16 GB)
 #
-#   This is an 80-package monorepo and the root scripts run turbo with
-#   `--concurrency 16`, with vitest forking workers underneath. The default
-#   `medium` (2 vCPU / 4 GB) both serialises the work and risks the Node heap
-#   on the larger vitest projects. `large` is the smallest class that keeps
-#   wall-clock sane without over-paying for credits.
+#   This is not premature scaling -- it is a fix for an observed failure.
+#   On `large` (4 vCPU) the suite went red with:
 #
-# ONE JOB, NOT THREE
+#       FAIL packages/gateway/src/gateway-transcription-model.test.ts
+#       Error: Test timed out in 5000ms.
 #
-#   Install / build / test are three steps in a single job rather than three
-#   parallel jobs on purpose. pnpm installs a symlink farm (a root
-#   `node_modules/.pnpm` store plus per-package symlinks), and CircleCI's
-#   `persist_to_workspace` / `attach_workspace` do not round-trip that layout
-#   reliably -- and re-hydrating ~1GB of it would cost more than the install it
-#   saves. Keeping one job also lets turbo's local task cache serve the build
-#   artifacts straight to the test step.
+#   That test is a pure unit test whose body starts with a dynamic
+#   `await import('./gateway-provider')`. Vitest's default 5s per-test timeout
+#   has to cover Vite transforming and loading that module graph, and the run
+#   summary showed the cost of starvation plainly: 47s wall for the package,
+#   of which `import 63.73s` and `transform 23.07s` (summed across workers).
+#   The same class of failure reproduces in `packages/ai`
+#   (`generate-text/output-declaration.test.ts`, which compiles TypeScript
+#   inside the test) on a contended machine. Nothing is broken in the repo:
+#   the box was simply oversubscribed, so latency-sensitive tests blew their
+#   deadline. The fix is headroom, applied on two axes -- more CPU here, and
+#   less oversubscription via the concurrency settings below.
 #
-# WHY THESE STEP COMMANDS AND FLAGS
+# CONCURRENCY: turbo invoked directly instead of via the root npm scripts
 #
-#   * `circleci run circleci/setup-node@0.0.1-15ea7e5 -- install`
-#     - Version pinned to the current release from
-#       https://functions.circleci.com/circleci/setup-node/release.txt so the
-#       install behaviour is reproducible.
-#     - No `--app-dir`: the workspace root (the default `.`) is where
-#       `package.json` and `pnpm-lock.yaml` live.
-#     - No `--package-manager`: `pnpm-lock.yaml` is the only lockfile in the
-#       root, so auto-detection picks pnpm and runs the frozen
-#       `pnpm install --frozen-lockfile`. A frozen install is what we want in
-#       CI -- it fails loudly if the lockfile drifted from package.json.
-#     - No `--no-with-cache`: caching is on by default and the function owns
-#       the whole cache lifecycle, keyed on OS/arch/package-manager plus a
-#       checksum of the lockfile. That is why there are deliberately NO
-#       `restore_cache` / `save_cache` steps here -- adding them is documented
-#       as wrong for this function.
+#   The obvious commands would be `pnpm build:packages` and `pnpm test`, and
+#   the turbo invocations below are deliberately identical to those scripts
+#   except for `--concurrency`. The root scripts hard-code `--concurrency 16`,
+#   which is tuned for a developer laptop; on a CI container it means up to 16
+#   vitest processes, each of which then forks `cpus - 1` workers of its own --
+#   ~48 processes on 4 vCPU, which is what caused the timeout above. We cannot
+#   just append our own value, because turbo rejects a repeated flag
+#   ("the argument '--concurrency <CONCURRENCY>' cannot be used multiple
+#   times"), and a `TURBO_CONCURRENCY` env var loses to the explicit flag in
+#   the script. So we call turbo ourselves. Keep these filters in sync with the
+#   root `build:packages` / `test` scripts if those change.
 #
-#   * `pnpm build:packages` (= `turbo build --filter=@ai-sdk/* --filter=ai`)
-#     rather than the root `pnpm build`. The shippable project is the SDK
-#     packages; the root `build` additionally compiles `apps/docs` and the 26
-#     demo apps under `examples/*` (Next/Nuxt/SvelteKit/Angular), which are
-#     never published and several of which want provider API keys at build
-#     time. This is the same build the repo's own release script
-#     (`ci:release`) runs.
+#   * build `--concurrency 8` -- one task per vCPU. The long pole is tsup's
+#     single-threaded `.d.ts` rollup, so tasks parallelise cleanly.
+#   * test `--concurrency 4` with `VITEST_MAX_WORKERS=2` -- at most
+#     4 x (1 main + 2 workers) = 12 processes on 8 vCPU. Vitest 4 reads
+#     `VITEST_MAX_WORKERS` and hard-overrides `maxWorkers`, which is the only
+#     way to cap per-package forking without editing 80 vitest configs.
 #
-#   * `pnpm test` (= `turbo test --concurrency 16 --filter=!@example/*`)
-#     rather than the repo's `test:ci`. `test:ci` additionally excludes the
-#     flagship `ai` package and `@ai-sdk/codemod`, which are exactly the
-#     packages a regression is most likely to land in, so we run the full
-#     suite and only drop the `examples/*` demos (they have no tests).
-#     turbo's `test` task declares `dependsOn: ["^build", "build"]`, so the
-#     previous step's cached build artifacts are reused, not rebuilt.
+# WHY THESE FILTERS
+#
+#   * build: `--filter='@ai-sdk/*' --filter=ai` (i.e. the root
+#     `build:packages`) rather than the root `pnpm build`. The shippable
+#     project is the SDK packages; the root `build` additionally compiles
+#     `apps/docs` and the 26 demo apps under `examples/*`
+#     (Next/Nuxt/SvelteKit/Angular), which are never published and several of
+#     which want provider API keys at build time. This is the same build the
+#     repo's own release script (`ci:release`) runs.
+#   * test: `--filter='!@example/*'` (i.e. the root `test`) rather than the
+#     repo's `test:ci`. `test:ci` additionally excludes the flagship `ai`
+#     package and `@ai-sdk/codemod`, which are exactly where a regression is
+#     most likely to land, so we run the full suite and only drop the
+#     `examples/*` demos (they have no tests). That is 160 turbo tasks across
+#     78 packages, ~4.4k tests.
+#   * turbo's `test` task declares `dependsOn: ["^build", "build"]`, so the
+#     build step's results are served from turbo's local cache rather than
+#     rebuilt. The explicit build step is kept anyway: it gives a compile
+#     failure its own red step instead of burying it in test output.
+#
+# WHY ONE JOB INSTEAD OF THREE
+#
+#   Install / build / test are three steps in a single job on purpose. pnpm
+#   installs a symlink farm (a root `node_modules/.pnpm` store plus
+#   per-package symlinks), and CircleCI's `persist_to_workspace` /
+#   `attach_workspace` do not round-trip that layout reliably -- and
+#   re-hydrating ~1GB of it would cost more than the 100s install it saves.
+#   One job is also what lets turbo's local cache carry build output into the
+#   test step.
+#
+# THE `|| retry` ON THE TEST STEP
+#
+#   A second `turbo run test` re-runs *only* the packages that failed: turbo
+#   caches successful tasks by hash and does not cache failures, so passing
+#   packages come back as "cache hit, replaying logs" in a few seconds. The
+#   retry drops to `--concurrency 1` for maximum headroom. This rescues the
+#   timing-sensitive tests described above without hiding anything -- a test
+#   that is genuinely broken fails on the retry too and the step still goes
+#   red.
 #
 # ENVIRONMENT FLAGS
 #
-#   * SKIP_RSC_E2E=1 -- `packages/rsc`'s `test` script chains
-#     `test:e2e:ci`, which boots a Next.js server and drives it with
-#     Playwright. `packages/rsc/scripts/run-e2e-ci.mjs` exits early when this
-#     is "1". Browser binaries are not in this image, so without the flag that
-#     one package fails the whole suite. It is declared in `turbo.json`'s
+#   * SKIP_RSC_E2E=1 -- `packages/rsc`'s `test` script chains `test:e2e:ci`,
+#     which boots a Next.js server and drives it with Playwright.
+#     `packages/rsc/scripts/run-e2e-ci.mjs` exits early when this is "1".
+#     Browser binaries are not in this image, so without the flag that one
+#     package fails the whole suite. It is declared in `turbo.json`'s
 #     `test.env`, so it correctly participates in turbo's cache key.
+#   * VITEST_MAX_WORKERS=2 -- see the concurrency note above.
 #   * TURBO_TELEMETRY_DISABLED / NEXT_TELEMETRY_DISABLED / DO_NOT_TRACK --
-#     no phoning home from CI, and no first-run telemetry prompts polluting
-#     the step output.
+#     no phoning home from CI, and no first-run telemetry notices polluting
+#     step output.
 #   * CI=1 is already set by CircleCI and is in turbo's `globalEnv`.
 #
-#   `no_output_timeout` is raised above the 10-minute default on the build and
-#   test steps: turbo batches output per task, so a long-running package can
+#   `no_output_timeout` is raised above the 10-minute default on the long
+#   steps: turbo batches output per task, so a single long-running package can
 #   legitimately go quiet for a while.
+#
+# NO restore_cache / save_cache
+#
+#   Deliberate. `circleci/setup-node` owns the whole pnpm-store cache
+#   lifecycle internally, keyed on OS/arch/package-manager plus a checksum of
+#   the lockfile, and its README calls out wrapping it in manual cache steps
+#   as the wrong thing to do.
 #
 # =============================================================================
 
@@ -103,22 +139,34 @@ jobs:
   build-and-test:
     docker:
       - image: cimg/node:22.23.2
-    resource_class: large
+    resource_class: xlarge
     environment:
       SKIP_RSC_E2E: '1'
+      VITEST_MAX_WORKERS: '2'
       TURBO_TELEMETRY_DISABLED: '1'
       NEXT_TELEMETRY_DISABLED: '1'
       DO_NOT_TRACK: '1'
     steps:
       - checkout
 
+      # Cheap canary: if a future image bump changes Node or drifts pnpm away
+      # from the `packageManager` field, it shows up here rather than as a
+      # confusing failure further down.
       - run:
           name: Report toolchain versions
           command: |
             echo "node    $(node --version)"
             echo "pnpm    $(pnpm --version)"
+            echo "nproc   $(nproc)"
             echo "arch    $(uname -m)"
 
+      # Auto-detects pnpm from the root pnpm-lock.yaml and runs the frozen
+      # `pnpm install --frozen-lockfile`, which is what we want in CI: it fails
+      # loudly if the lockfile drifted from package.json. No --app-dir (the
+      # default `.` is the workspace root), no --package-manager (pnpm-lock.yaml
+      # is the only lockfile), no --no-with-cache (we want the built-in cache).
+      # Version pinned to the current release from
+      # https://functions.circleci.com/circleci/setup-node/release.txt
       - run:
           name: Install dependencies (circleci/setup-node)
           command: circleci run circleci/setup-node@0.0.1-15ea7e5 -- install
@@ -126,17 +174,25 @@ jobs:
 
       - run:
           name: Build packages
-          command: pnpm build:packages
+          command: pnpm exec turbo run build --filter='@ai-sdk/*' --filter=ai --concurrency 8
           no_output_timeout: 20m
 
       - run:
           name: Run test suite
-          command: pnpm test
-          no_output_timeout: 30m
+          command: |
+            pnpm exec turbo run test --filter='!@example/*' --concurrency 4 \
+              || {
+                echo ""
+                echo ">>> Test run failed. Retrying the failed packages only"
+                echo ">>> (turbo replays cached passes) at --concurrency 1."
+                echo ""
+                pnpm exec turbo run test --filter='!@example/*' --concurrency 1
+              }
+          no_output_timeout: 40m
 
 workflows:
-  # No branch filters: this runs on every push to every branch, which is what
-  # we want as the baseline signal for the repo.
+  # No branch filters: this runs on every push to every branch, which is the
+  # baseline signal we want for the repo.
   build-and-test:
     jobs:
       - build-and-test

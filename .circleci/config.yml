@@ -1,0 +1,142 @@
+version: 2.1
+
+# =============================================================================
+# Why this config looks the way it does
+# =============================================================================
+#
+# EXECUTOR IMAGE: cimg/node:22.23.2
+#
+#   * `package.json` sets `engines.node` to "^22.13.0 || ^24.0.0 || ^26.0.0",
+#     so the floor is Node 22.13. We pin the newest 22.x convenience image
+#     rather than 24/26 because 22 is the oldest supported line -- if the build
+#     is green on the floor it is green on the newer lines, and the reverse is
+#     not true.
+#   * The tag is fully pinned (22.23.2, not `22` or `22.23`) so a rebuild of
+#     the upstream image cannot silently change the toolchain under us. Bump it
+#     deliberately.
+#   * `cimg/node` (not the plain `node` Docker Hub image) because CircleCI's
+#     convenience images ship git, ca-certs, a non-root `circleci` user with
+#     sudo, and -- importantly here -- a global `pnpm`. `circleci/setup-node`
+#     requires the package manager binary to already be on PATH; it does not
+#     install one. See CircleCI-Public/cimg-node's Dockerfile.template:
+#     `RUN sudo npm install -g pnpm`.
+#   * We use the plain tag, NOT `-browsers`. The `-browsers` variant exists to
+#     supply Chrome/Firefox for the Playwright suite in `packages/rsc`, but we
+#     skip that suite instead (see SKIP_RSC_E2E below), so the extra ~1GB of
+#     image pull would be dead weight on every run.
+#   * pnpm 10+ honours the `packageManager` field ("pnpm@11.23.0"), so pnpm
+#     self-provisions that exact version at first invocation. The pnpm baked
+#     into the image is only a bootstrap.
+#
+# RESOURCE CLASS: large (4 vCPU / 8 GB)
+#
+#   This is an 80-package monorepo and the root scripts run turbo with
+#   `--concurrency 16`, with vitest forking workers underneath. The default
+#   `medium` (2 vCPU / 4 GB) both serialises the work and risks the Node heap
+#   on the larger vitest projects. `large` is the smallest class that keeps
+#   wall-clock sane without over-paying for credits.
+#
+# ONE JOB, NOT THREE
+#
+#   Install / build / test are three steps in a single job rather than three
+#   parallel jobs on purpose. pnpm installs a symlink farm (a root
+#   `node_modules/.pnpm` store plus per-package symlinks), and CircleCI's
+#   `persist_to_workspace` / `attach_workspace` do not round-trip that layout
+#   reliably -- and re-hydrating ~1GB of it would cost more than the install it
+#   saves. Keeping one job also lets turbo's local task cache serve the build
+#   artifacts straight to the test step.
+#
+# WHY THESE STEP COMMANDS AND FLAGS
+#
+#   * `circleci run circleci/setup-node@0.0.1-15ea7e5 -- install`
+#     - Version pinned to the current release from
+#       https://functions.circleci.com/circleci/setup-node/release.txt so the
+#       install behaviour is reproducible.
+#     - No `--app-dir`: the workspace root (the default `.`) is where
+#       `package.json` and `pnpm-lock.yaml` live.
+#     - No `--package-manager`: `pnpm-lock.yaml` is the only lockfile in the
+#       root, so auto-detection picks pnpm and runs the frozen
+#       `pnpm install --frozen-lockfile`. A frozen install is what we want in
+#       CI -- it fails loudly if the lockfile drifted from package.json.
+#     - No `--no-with-cache`: caching is on by default and the function owns
+#       the whole cache lifecycle, keyed on OS/arch/package-manager plus a
+#       checksum of the lockfile. That is why there are deliberately NO
+#       `restore_cache` / `save_cache` steps here -- adding them is documented
+#       as wrong for this function.
+#
+#   * `pnpm build:packages` (= `turbo build --filter=@ai-sdk/* --filter=ai`)
+#     rather than the root `pnpm build`. The shippable project is the SDK
+#     packages; the root `build` additionally compiles `apps/docs` and the 26
+#     demo apps under `examples/*` (Next/Nuxt/SvelteKit/Angular), which are
+#     never published and several of which want provider API keys at build
+#     time. This is the same build the repo's own release script
+#     (`ci:release`) runs.
+#
+#   * `pnpm test` (= `turbo test --concurrency 16 --filter=!@example/*`)
+#     rather than the repo's `test:ci`. `test:ci` additionally excludes the
+#     flagship `ai` package and `@ai-sdk/codemod`, which are exactly the
+#     packages a regression is most likely to land in, so we run the full
+#     suite and only drop the `examples/*` demos (they have no tests).
+#     turbo's `test` task declares `dependsOn: ["^build", "build"]`, so the
+#     previous step's cached build artifacts are reused, not rebuilt.
+#
+# ENVIRONMENT FLAGS
+#
+#   * SKIP_RSC_E2E=1 -- `packages/rsc`'s `test` script chains
+#     `test:e2e:ci`, which boots a Next.js server and drives it with
+#     Playwright. `packages/rsc/scripts/run-e2e-ci.mjs` exits early when this
+#     is "1". Browser binaries are not in this image, so without the flag that
+#     one package fails the whole suite. It is declared in `turbo.json`'s
+#     `test.env`, so it correctly participates in turbo's cache key.
+#   * TURBO_TELEMETRY_DISABLED / NEXT_TELEMETRY_DISABLED / DO_NOT_TRACK --
+#     no phoning home from CI, and no first-run telemetry prompts polluting
+#     the step output.
+#   * CI=1 is already set by CircleCI and is in turbo's `globalEnv`.
+#
+#   `no_output_timeout` is raised above the 10-minute default on the build and
+#   test steps: turbo batches output per task, so a long-running package can
+#   legitimately go quiet for a while.
+#
+# =============================================================================
+
+jobs:
+  build-and-test:
+    docker:
+      - image: cimg/node:22.23.2
+    resource_class: large
+    environment:
+      SKIP_RSC_E2E: '1'
+      TURBO_TELEMETRY_DISABLED: '1'
+      NEXT_TELEMETRY_DISABLED: '1'
+      DO_NOT_TRACK: '1'
+    steps:
+      - checkout
+
+      - run:
+          name: Report toolchain versions
+          command: |
+            echo "node    $(node --version)"
+            echo "pnpm    $(pnpm --version)"
+            echo "arch    $(uname -m)"
+
+      - run:
+          name: Install dependencies (circleci/setup-node)
+          command: circleci run circleci/setup-node@0.0.1-15ea7e5 -- install
+          no_output_timeout: 20m
+
+      - run:
+          name: Build packages
+          command: pnpm build:packages
+          no_output_timeout: 20m
+
+      - run:
+          name: Run test suite
+          command: pnpm test
+          no_output_timeout: 30m
+
+workflows:
+  # No branch filters: this runs on every push to every branch, which is what
+  # we want as the baseline signal for the repo.
+  build-and-test:
+    jobs:
+      - build-and-test
